@@ -27,7 +27,7 @@ from release_pr_status import (
     format_release_tasks_pr_report,
 )
 from release_flow import evaluate_release_gates, format_release_gate_report
-from arch import ArchitectureFieldFixer, JIRA_URL as ARCH_JIRA_URL, JIRA_TOKEN as ARCH_JIRA_TOKEN
+from arch import JIRA_TOKEN as ARCH_JIRA_TOKEN
 from master_analyzer import MasterServicesAnalyzer, ConfluenceDeployPlanGenerator
 
 # === ИМПОРТЫ ДЛЯ ИИ-АГЕНТА ===
@@ -1920,23 +1920,13 @@ class ModernJiraApp(ctk.CTk):
             release = self.jira_service.get_issue_details(release_key)
             if not release:
                 raise ValueError(f"Релиз {release_key} не найден.")
+            self.after(0, lambda: self.progress_bar.set(0.15))
+
+            # Новая логика: берем ЛЮБУЮ Story из состава релиза и используем ее project+fixVersion.
+            project_key = (forced_project_key or "").strip().upper()
+            fix_version = (forced_fix_version or "").strip()
 
             linked_keys = self.jira_service.get_linked_issues(release_key)
-            story_pairs: set[tuple[str, str]] = set()
-            consist_projects: set[str] = set()
-
-            for link in release.get("fields", {}).get("issuelinks", []) or []:
-                link_type = link.get("type", {}) or {}
-                outward_name = (link_type.get("outward") or "").lower()
-                inward_name = (link_type.get("inward") or "").lower()
-                is_consists = "consists of" in outward_name or "consists of" in inward_name
-                if not is_consists:
-                    continue
-                target = link.get("outwardIssue") or link.get("inwardIssue") or {}
-                key = (target.get("key") or "").upper()
-                if "-" in key:
-                    consist_projects.add(key.split("-", 1)[0])
-
             for idx, key in enumerate(linked_keys, start=1):
                 issue = self.jira_service.get_issue_details(key)
                 if not issue:
@@ -1944,138 +1934,119 @@ class ModernJiraApp(ctk.CTk):
                 issue_type = (issue.get("fields", {}).get("issuetype", {}).get("name") or "").lower()
                 if issue_type != "story":
                     continue
-                project_key = issue.get("fields", {}).get("project", {}).get("key", "")
-                fix_versions = issue.get("fields", {}).get("fixVersions", []) or []
-                for fv in fix_versions:
-                    fv_name = fv.get("name")
-                    if project_key and fv_name:
-                        story_pairs.add((project_key, fv_name))
+
+                if not project_key:
+                    project_key = (issue.get("fields", {}).get("project", {}).get("key") or "").strip().upper()
+                if not fix_version:
+                    for fv in issue.get("fields", {}).get("fixVersions", []) or []:
+                        name = (fv.get("name") or "").strip()
+                        if name and not re.fullmatch(r"HRPRELEASE-\d+", name, re.IGNORECASE):
+                            fix_version = name
+                            break
+
                 self.after(
                     0,
-                    lambda p=min(0.6, idx / max(len(linked_keys), 1) * 0.6): self.progress_bar.set(p),
+                    lambda p=min(0.45, 0.15 + idx / max(len(linked_keys), 1) * 0.3): self.progress_bar.set(p),
                 )
+                if project_key and fix_version:
+                    break
 
-            if forced_project_key and forced_fix_version:
-                story_pairs.add((forced_project_key, forced_fix_version))
+            # Fallback: project из consists-of, если Story не дала project.
+            if not project_key:
+                for link in release.get("fields", {}).get("issuelinks", []) or []:
+                    link_type = link.get("type", {}) or {}
+                    outward_name = (link_type.get("outward") or "").lower()
+                    inward_name = (link_type.get("inward") or "").lower()
+                    if "consists of" not in outward_name and "consists of" not in inward_name:
+                        continue
+                    target = link.get("outwardIssue") or link.get("inwardIssue") or {}
+                    key = (target.get("key") or "").strip().upper()
+                    if "-" in key:
+                        project_key = key.split("-", 1)[0]
+                        break
 
-            if not story_pairs:
-                release_versions = release.get("fields", {}).get("fixVersions", []) or []
-                release_project = (release.get("fields", {}).get("project", {}).get("key", "") or "").upper()
-                fix_candidates = [
-                    v.get("name")
-                    for v in release_versions
-                    if v.get("name")
-                    and not re.fullmatch(r"HRPRELEASE-\d+", str(v.get("name")), re.IGNORECASE)
-                ]
-                ui_fix = self.version_entry.get().strip()
+            # Fallback: fixVersion из поля релиза или UI.
+            if not fix_version:
+                for fv in release.get("fields", {}).get("fixVersions", []) or []:
+                    name = (fv.get("name") or "").strip()
+                    if name and not re.fullmatch(r"HRPRELEASE-\d+", name, re.IGNORECASE):
+                        fix_version = name
+                        break
+            if not fix_version:
+                ui_fix = (self.version_entry.get() or "").strip()
                 if ui_fix and not re.fullmatch(r"HRPRELEASE-\d+", ui_fix, re.IGNORECASE):
-                    fix_candidates.append(ui_fix)
-                fix_candidates = sorted(set(fix_candidates))
+                    fix_version = ui_fix
 
-                project_candidates = set()
-                if release_project:
-                    project_candidates.add(release_project)
-                project_candidates.update(consist_projects)
-                if forced_project_key:
-                    project_candidates.add(forced_project_key.upper())
-
-                for pk in project_candidates:
-                    for fv_name in fix_candidates:
-                        story_pairs.add((pk, fv_name))
-
-            if forced_project_key and not forced_fix_version:
-                release_versions = release.get("fields", {}).get("fixVersions", []) or []
-                for fv in release_versions:
-                    fv_name = fv.get("name")
-                    if fv_name and not re.fullmatch(r"HRPRELEASE-\d+", str(fv_name), re.IGNORECASE):
-                        story_pairs.add((forced_project_key, fv_name))
-                ui_fix = self.version_entry.get().strip()
-                if ui_fix and not re.fullmatch(r"HRPRELEASE-\d+", ui_fix, re.IGNORECASE):
-                    story_pairs.add((forced_project_key, ui_fix))
-
-            if not story_pairs and forced_fix_version:
-                release_project = (release.get("fields", {}).get("project", {}).get("key", "") or "").upper()
-                if release_project:
-                    story_pairs.add((release_project, forced_fix_version))
-                for pk in consist_projects:
-                    story_pairs.add((pk, forced_fix_version))
-
-            # Отфильтровать пустые пары
-            story_pairs = {
-                (pk.strip().upper(), fv.strip())
-                for pk, fv in story_pairs
-                if (pk or "").strip() and (fv or "").strip()
-            }
-
-            if not story_pairs:
+            if not project_key or not fix_version:
                 self.ai_assistant.pending_arch_release_key = release_key
-                msg = (
-                    "Не удалось определить project_key/fix_version автоматически. "
-                    "Укажи их в одном сообщении, например: 'HRC HM-REL-05-03-2026' "
-                    "или 'project HRC, fixVersion HM-REL-05-03-2026'."
-                )
-                raise ValueError(msg)
-
-            # Приоритет project, найденным по consists of: если есть, не запускать лишние проекты.
-            if consist_projects:
-                story_pairs = {
-                    (pk, fv)
-                    for pk, fv in story_pairs
-                    if pk in consist_projects or pk == forced_project_key
-                }
-
-            if not story_pairs:
-                self.ai_assistant.pending_arch_release_key = release_key
+                missing = []
+                if not project_key:
+                    missing.append("project_key")
+                if not fix_version:
+                    missing.append("fix_version")
                 raise ValueError(
-                    "В релизе не найдено consists-of проектов для проставления архитектуры. "
-                    "Укажи project_key и fix_version вручную."
+                    "Не удалось определить " + ", ".join(missing) + ". "
+                    "Пришли уточнение, например: 'HRC WEB-2026.03.X' "
+                    "или 'project HRC, fixVersion WEB-2026.03.X'."
                 )
 
-            fixer = ArchitectureFieldFixer(ARCH_JIRA_URL, ARCH_JIRA_TOKEN)
-            total_runs = len(story_pairs)
-            total_fixed = 0
-            total_need = 0
-            total_errors = 0
-            details = []
-
-            for i, (project_key, fix_version) in enumerate(sorted(story_pairs), start=1):
-                self.after(
-                    0,
-                    lambda pk=project_key, fv=fix_version: self.details_label.configure(
-                        text=f"Обработка: {pk} / {fv}"
-                    ),
-                )
-                stats = fixer.find_and_fix_stories(
-                    project_key=project_key,
-                    fix_version=fix_version,
-                    auto_confirm=True,
-                )
-                total_need += int(stats.get("need_fix", 0))
-                total_fixed += int(stats.get("fixed", 0))
-                total_errors += int(stats.get("errors", 0))
-                details.append(f"{project_key}/{fix_version}: {stats.get('fixed', 0)}/{stats.get('need_fix', 0)}")
-                progress = 0.6 + (i / max(total_runs, 1) * 0.4)
-                self.after(0, lambda p=progress: self.progress_bar.set(min(p, 1.0)))
-
-            summary = (
-                f"Архитектура: успешно {total_fixed}/{total_need}, ошибок {total_errors}. "
-                f"Пакетов: {total_runs}."
+            self.after(
+                0,
+                lambda pk=project_key, fv=fix_version: self.details_label.configure(
+                    text=f"Запуск arch.py: {pk} / {fv}"
+                ),
             )
-            detail_text = "\n".join(details)
+            self.after(0, lambda: self.progress_bar.set(0.55))
+
+            script_path = os.path.join(os.path.dirname(__file__), "arch.py")
+            if not os.path.exists(script_path):
+                raise FileNotFoundError(f"Скрипт не найден: {script_path}")
+
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    script_path,
+                    "--project-key",
+                    project_key,
+                    "--fix-version",
+                    fix_version,
+                    "--yes",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            stdout = process.stdout or ""
+            stderr = process.stderr or ""
+            self.after(0, lambda: self.progress_bar.set(1.0))
+
+            if process.returncode != 0:
+                raise RuntimeError(
+                    "arch.py завершился с ошибкой.\n"
+                    f"STDOUT:\n{stdout[-3000:]}\n\nSTDERR:\n{stderr[-3000:]}"
+                )
+
+            fixed_match = re.search(r"Успешно установлено значение:\s*(\d+)", stdout)
+            fixed_count = int(fixed_match.group(1)) if fixed_match else None
+            summary = (
+                f"Архитектура проставлена для релиза {release_key}: "
+                f"{project_key}/{fix_version}"
+            )
+            if fixed_count is not None:
+                summary += f", успешно: {fixed_count}"
 
             self.after(0, lambda: self.update_status("Готово"))
-            self.after(0, lambda: self.add_result(f"✅ {summary}"))
-            self.after(0, lambda: self.add_result(f"ℹ️ Детали:\n{detail_text}"))
+            self.after(0, lambda s=summary: self.add_result(f"✅ {s}"))
             self.history.add(
                 "Архитектура Story",
-                {"release": release_key, "runs": total_runs, "fixed": total_fixed, "need_fix": total_need, "errors": total_errors},
+                {"release": release_key, "project_key": project_key, "fix_version": fix_version},
             )
             self.history.save_to_file(self.history_path)
 
             if announce_in_chat:
                 self.append_ai_chat(
-                    f"🤖 Blast AI: Проставление архитектуры для {release_key} завершено.\n"
-                    f"{summary}\n{detail_text}\n\n"
+                    f"🤖 Blast AI: {summary}\n\n"
                 )
         except Exception as e:
             error_text = f"Ошибка проставления архитектуры: {e}"
