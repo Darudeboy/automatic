@@ -127,6 +127,18 @@ class JiraService:
             self.logger.error(f"Ошибка получения remote links для {issue_key}: {e}")
             return []
 
+    def get_issue_comments(self, issue_key: str) -> List[dict]:
+        """Получение комментариев Jira-задачи."""
+        try:
+            response = self.jira.get(f"/rest/api/2/issue/{issue_key}/comment")
+            comments = response.get("comments", []) if isinstance(response, dict) else []
+            if isinstance(comments, list):
+                return comments
+            return []
+        except Exception as e:
+            self.logger.error(f"Ошибка получения комментариев для {issue_key}: {e}")
+            return []
+
     def get_dev_status_prs(self, issue_id: str) -> List[dict]:
         """Получение PR из панели Development (Stash/Bitbucket интеграция)."""
         try:

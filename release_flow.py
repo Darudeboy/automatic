@@ -302,6 +302,27 @@ def _derive_business_project(release_issue: dict, related_issues: List[dict]) ->
     return str(release_issue.get("fields", {}).get("project", {}).get("key", "")).strip().upper()
 
 
+def _comment_text(comment: dict) -> str:
+    body = comment.get("body", "")
+    if isinstance(body, str):
+        return body
+    # Jira иногда возвращает body как ADF-структуру.
+    return str(body)
+
+
+def _extract_rqg_comment_signals(comments: List[dict]) -> Dict[str, bool]:
+    text_blob = "\n".join(_comment_text(c) for c in comments).lower()
+    return {
+        "rqg_success": "проверки rqg успешно выполнены" in text_blob or "rqg" in text_blob and "успеш" in text_blob,
+        "testing_completed": "запланированный объём тестирования: выполнен" in text_blob
+        or "запланированный объем тестирования: выполнен" in text_blob,
+        "no_critical_bugs": "открытые блокирующие и критичные дефекты: нет" in text_blob
+        or "критичные дефекты: нет" in text_blob,
+        "recommended_to_psi": "рекомендации по переводу на пси: рекомендован" in text_blob
+        or "рекомендован" in text_blob and "пси" in text_blob,
+    }
+
+
 def _next_transition(current_status: str, workflow_order: List[str]) -> Optional[str]:
     normalized = [_norm(x) for x in workflow_order]
     current = _norm(current_status)
@@ -373,6 +394,16 @@ def evaluate_release_gates(
     dist_registered_ok = _is_distribution_registered(release, profile)
     recommendation_ok = _is_ift_recommended(release, profile)
 
+    rqg_signals = _extract_rqg_comment_signals(jira_service.get_issue_comments(safe_release))
+    if rqg_signals.get("rqg_success"):
+        if rqg_signals.get("recommended_to_psi"):
+            recommendation_ok = True
+        # Если RQG в комментарии успешен и тестирование/дефекты в норме,
+        # считаем дистрибутивный блок пройденным.
+        if rqg_signals.get("testing_completed") and rqg_signals.get("no_critical_bugs"):
+            dist_link_ok = True
+            dist_registered_ok = True
+
     dist_gate = {
         "id": "distribution_tab",
         "title": "Вкладка Дистрибутивы",
@@ -427,6 +458,7 @@ def evaluate_release_gates(
         "manual_done": manual_done,
         "story_results": story_results,
         "bug_results": bug_results,
+        "rqg_comment_signals": rqg_signals,
     }
 
 
@@ -441,6 +473,8 @@ def format_release_gate_report(result: Dict[str, Any]) -> str:
     lines.append(f"Профиль: {result.get('profile_name')} | Проект: {result.get('project_key')}")
     lines.append(f"Текущий этап: {result.get('current_stage')}")
     lines.append(f"Следующий этап: {result.get('next_allowed_transition') or 'нет'}")
+    if result.get("rqg_comment_signals", {}).get("rqg_success"):
+        lines.append("RQG в комментариях: найден успешный результат")
     lines.append("")
 
     lines.append(f"✅ Авто-гейты пройдены: {len(result.get('auto_passed', []))}")
