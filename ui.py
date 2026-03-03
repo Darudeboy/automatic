@@ -261,24 +261,34 @@ class BlastAIAssistant:
             if not isinstance(parsed, dict):
                 continue
 
-            if parsed.get("tool"):
-                args = {k: v for k, v in parsed.items() if k != "tool"}
-                add_tool_call(parsed.get("tool"), args)
+            name_key = None
+            for k in ("tool", "function", "name"):
+                if parsed.get(k) and isinstance(parsed[k], str):
+                    name_key = k
+                    break
+
+            if name_key and name_key in ("tool", "function"):
+                args = {k: v for k, v in parsed.items() if k != name_key}
+                add_tool_call(parsed[name_key], args)
                 remaining = remaining.replace(candidate, "").strip()
-            elif parsed.get("name") and isinstance(parsed.get("args"), dict):
-                add_tool_call(parsed.get("name"), parsed.get("args"))
+            elif name_key == "name" and isinstance(parsed.get("args"), dict):
+                add_tool_call(parsed["name"], parsed["args"])
                 remaining = remaining.replace(candidate, "").strip()
-            elif parsed.get("name") and isinstance(parsed.get("arguments"), dict):
-                add_tool_call(parsed.get("name"), parsed.get("arguments"))
+            elif name_key == "name" and isinstance(parsed.get("arguments"), dict):
+                add_tool_call(parsed["name"], parsed["arguments"])
+                remaining = remaining.replace(candidate, "").strip()
+            elif name_key == "name":
+                args = {k: v for k, v in parsed.items() if k != "name"}
+                add_tool_call(parsed["name"], args)
                 remaining = remaining.replace(candidate, "").strip()
             elif isinstance(parsed.get("commands"), list):
                 for cmd in parsed["commands"]:
                     if not isinstance(cmd, dict):
                         continue
-                    name = cmd.get("tool") or cmd.get("name")
+                    n = cmd.get("tool") or cmd.get("function") or cmd.get("name")
                     args = cmd.get("args", cmd.get("arguments", {}))
-                    if name:
-                        add_tool_call(name, args)
+                    if n:
+                        add_tool_call(n, args)
                 remaining = remaining.replace(candidate, "").strip()
 
         # Попытка 2: отдельные словари внутри текста.
@@ -292,15 +302,15 @@ class BlastAIAssistant:
                 if not isinstance(action, dict):
                     continue
 
-                if action.get("tool"):
-                    args = {k: v for k, v in action.items() if k != "tool"}
-                    add_tool_call(action.get("tool"), args)
-                    remaining = remaining.replace(match, "")
-                elif action.get("name") and isinstance(action.get("args"), dict):
-                    add_tool_call(action.get("name"), action.get("args"))
-                    remaining = remaining.replace(match, "")
-                elif action.get("name") and isinstance(action.get("arguments"), dict):
-                    add_tool_call(action.get("name"), action.get("arguments"))
+                ak = None
+                for k in ("tool", "function", "name"):
+                    if action.get(k) and isinstance(action[k], str):
+                        ak = k
+                        break
+
+                if ak:
+                    args = {k: v for k, v in action.items() if k != ak}
+                    add_tool_call(action[ak], args)
                     remaining = remaining.replace(match, "")
 
         if not tool_calls:
@@ -789,6 +799,29 @@ class BlastAIAssistant:
             result = self.app_gui.start_link_issues_from_ai(
                 release_key=release_key,
                 fix_version=fix_version,
+            )
+            self.app_gui.append_ai_chat(f"🤖 Blast AI: {result}\n\n")
+            return True
+
+        pr_intent = any(
+            phrase in lowered
+            for phrase in (
+                "проверь задачи и pr",
+                "задачи и pr",
+                "статус pr",
+                "pr статус",
+                "check pr",
+                "check tasks and pr",
+            )
+        )
+        if pr_intent and release_match:
+            release_key = release_match.group(1).upper()
+            self.app_gui.append_ai_chat(
+                f"🛠️ [Агент] Прямая команда: проверка задач и PR для {release_key}\n"
+            )
+            result = self.app_gui.start_release_pr_status_check(
+                release_key=release_key,
+                announce_in_chat=True,
             )
             self.app_gui.append_ai_chat(f"🤖 Blast AI: {result}\n\n")
             return True
