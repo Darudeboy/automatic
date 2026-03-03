@@ -74,6 +74,39 @@ def _flatten_issue_fields(issue: dict) -> str:
     return " ".join(parts)
 
 
+def _find_field_value_by_display_name(
+    issue: dict,
+    name_keywords: List[str],
+    field_name_map: Optional[Dict[str, str]] = None,
+) -> Any:
+    """Ищет значение customfield по человекочитаемому имени поля (expand=names)."""
+    fields = issue.get("fields", {}) or {}
+    names = issue.get("names", {}) or {}
+    if not isinstance(names, dict):
+        return None
+
+    normalized_keywords = [_norm(x) for x in (name_keywords or []) if _norm(x)]
+    for field_id, display_name in names.items():
+        display = _norm(str(display_name))
+        if not display:
+            continue
+        if any(keyword in display for keyword in normalized_keywords):
+            value = fields.get(field_id)
+            if value not in (None, "", [], {}):
+                return value
+
+    # Fallback: если expand=names не вернулось, используем глобальную карту полей Jira.
+    global_map = field_name_map or {}
+    for field_id, value in fields.items():
+        display_name = _norm(str(global_map.get(field_id, "")))
+        if not display_name:
+            continue
+        if any(keyword in display_name for keyword in normalized_keywords):
+            if value not in (None, "", [], {}):
+                return value
+    return None
+
+
 def _has_distribution_link(release_issue: dict, profile: dict) -> bool:
     fields = release_issue.get("fields", {}) or {}
     tab = profile.get("distribution_tab", {})
@@ -98,10 +131,21 @@ def _has_distribution_link(release_issue: dict, profile: dict) -> bool:
     return True
 
 
-def _is_distribution_registered(release_issue: dict, profile: dict) -> bool:
+def _is_distribution_registered(
+    release_issue: dict,
+    profile: dict,
+    field_name_map: Optional[Dict[str, str]] = None,
+) -> bool:
     fields = release_issue.get("fields", {}) or {}
     tab = profile.get("distribution_tab", {})
     value = _find_issue_value_by_candidates(fields, tab.get("registered_fields", []))
+    if value in (None, "", [], {}):
+        # Приоритетно: строка "КЭ дистрибутива" (display-name поля из Jira).
+        value = _find_field_value_by_display_name(
+            release_issue,
+            tab.get("ke_keywords", []),
+            field_name_map=field_name_map,
+        )
     if isinstance(value, bool):
         return value
     if value is None:
@@ -122,7 +166,13 @@ def _is_distribution_registered(release_issue: dict, profile: dict) -> bool:
             if not any(re.search(pattern, blob, flags=re.IGNORECASE) for pattern in negative_patterns):
                 return True
         return False
-    return _contains_any(str(value), tab.get("registered_keywords", []))
+    value_text = str(value)
+    if _contains_any(value_text, tab.get("registered_keywords", [])):
+        return True
+    # Если в КЭ стоит конкретное значение версии/объекта (не "Н/Д"), считаем зарегистрированным.
+    if not re.search(r"\b(н/д|нет|none|n/a|not set)\b", value_text, flags=re.IGNORECASE):
+        return True
+    return False
 
 
 def _is_ift_recommended(release_issue: dict, profile: dict) -> bool:
@@ -346,7 +396,7 @@ def evaluate_release_gates(
 
     release = jira_service.get_issue_details(
         safe_release,
-        expand="issuelinks,renderedFields",
+        expand="issuelinks,renderedFields,names",
     )
     if not release:
         return {"success": False, "message": f"Релиз {safe_release} не найден."}
@@ -391,7 +441,12 @@ def evaluate_release_gates(
     (auto_passed if quality_gate["ok"] else auto_failed).append(quality_gate)
 
     dist_link_ok = _has_distribution_link(release, profile)
-    dist_registered_ok = _is_distribution_registered(release, profile)
+    field_name_map = jira_service.get_field_name_map()
+    dist_registered_ok = _is_distribution_registered(
+        release,
+        profile,
+        field_name_map=field_name_map,
+    )
     recommendation_ok = _is_ift_recommended(release, profile)
 
     rqg_signals = _extract_rqg_comment_signals(jira_service.get_issue_comments(safe_release))

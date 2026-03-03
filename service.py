@@ -15,6 +15,7 @@ class JiraService:
         self.config = config
         self._jira = None
         self._link_types_cache = None
+        self._field_name_map_cache: Optional[Dict[str, str]] = None
         self.logger = logging.getLogger(self.__class__.__name__)
 
     @property
@@ -138,6 +139,30 @@ class JiraService:
         except Exception as e:
             self.logger.error(f"Ошибка получения комментариев для {issue_key}: {e}")
             return []
+
+    def get_field_name_map(self) -> Dict[str, str]:
+        """Карта field_id -> display name из Jira."""
+        if self._field_name_map_cache is not None:
+            return self._field_name_map_cache
+        try:
+            fields = self.jira.get("/rest/api/2/field")
+            if not isinstance(fields, list):
+                self._field_name_map_cache = {}
+                return self._field_name_map_cache
+            result: Dict[str, str] = {}
+            for item in fields:
+                if not isinstance(item, dict):
+                    continue
+                field_id = str(item.get("id", "")).strip()
+                field_name = str(item.get("name", "")).strip()
+                if field_id:
+                    result[field_id] = field_name
+            self._field_name_map_cache = result
+            return result
+        except Exception as e:
+            self.logger.error(f"Ошибка получения списка полей Jira: {e}")
+            self._field_name_map_cache = {}
+            return self._field_name_map_cache
 
     def get_dev_status_prs(self, issue_id: str) -> List[dict]:
         """Получение PR из панели Development (Stash/Bitbucket интеграция)."""
