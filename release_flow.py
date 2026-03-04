@@ -352,6 +352,25 @@ def _derive_business_project(release_issue: dict, related_issues: List[dict]) ->
     return str(release_issue.get("fields", {}).get("project", {}).get("key", "")).strip().upper()
 
 
+def _distribution_from_related_issues(related_issues: List[dict]) -> Dict[str, bool]:
+    link_present = False
+    registered = False
+    dist_markers = ("дистриб", "distribution", "distrib", "release-notes", "install")
+    approved_markers = ("утвержден", "approved", "согласован", "выполн", "закры")
+
+    for issue in related_issues:
+        fields = issue.get("fields", {}) or {}
+        issue_type = str(fields.get("issuetype", {}).get("name", ""))
+        summary = str(fields.get("summary", ""))
+        status = str(fields.get("status", {}).get("name", ""))
+        text = f"{issue_type} {summary}".lower()
+        if any(marker in text for marker in dist_markers):
+            link_present = True
+            if any(marker in status.lower() for marker in approved_markers):
+                registered = True
+    return {"link_present": link_present, "registered": registered}
+
+
 def _comment_text(comment: dict) -> str:
     body = comment.get("body", "")
     if isinstance(body, str):
@@ -459,6 +478,13 @@ def evaluate_release_gates(
             dist_link_ok = True
             dist_registered_ok = True
 
+    # Дополнительный fallback:
+    # если дистрибутив оформлен как отдельная связанная задача со статусом "Утвержден",
+    # учитываем это как валидный признак "прилинкован + зарегистрирован".
+    dist_from_links = _distribution_from_related_issues(related_issues)
+    dist_link_ok = dist_link_ok or dist_from_links["link_present"]
+    dist_registered_ok = dist_registered_ok or dist_from_links["registered"]
+
     dist_gate = {
         "id": "distribution_tab",
         "title": "Вкладка Дистрибутивы",
@@ -466,6 +492,7 @@ def evaluate_release_gates(
         "details": {
             "link_present": dist_link_ok,
             "registered": dist_registered_ok,
+            "linked_distribution_issue": dist_from_links,
         },
     }
     (auto_passed if dist_gate["ok"] else auto_failed).append(dist_gate)

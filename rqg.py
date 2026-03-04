@@ -181,8 +181,40 @@ def analyze_rqg_for_release(jira_service, release_key: str, max_depth: int = 2) 
 
 def trigger_rqg_button(jira_service, release_key: str, button_name: Optional[str] = None) -> Dict:
     """Нажимает кнопку/переход RQG в Jira на релизной задаче."""
-    transition_name = (button_name or os.getenv("RQG_TRANSITION_NAME", "RQG")).strip()
-    ok, message = jira_service.transition_issue(release_key, transition_name)
+    raw_candidates = os.getenv(
+        "RQG_TRANSITION_NAMES",
+        os.getenv("RQG_TRANSITION_NAME", "RQG,Проверка RQG,Проверки RQG,Run RQG"),
+    )
+    if button_name and button_name.strip():
+        candidates = [button_name.strip()]
+    else:
+        candidates = [item.strip() for item in raw_candidates.split(",") if item.strip()]
+        if not candidates:
+            candidates = ["RQG"]
+
+    ok = False
+    message = "Кнопка RQG не найдена"
+    transition_name = candidates[0]
+    for candidate in candidates:
+        transition_name = candidate
+        ok, message = jira_service.transition_issue(release_key, candidate)
+        if ok:
+            break
+
+    if not ok:
+        # Fallback: пробуем автопоиск по доступным переходам с 'rqg' в названии.
+        transitions = jira_service.get_available_transitions(release_key)
+        rqg_named = [
+            t.get("name", "")
+            for t in transitions
+            if "rqg" in (t.get("name", "") or "").lower()
+        ]
+        for name in rqg_named:
+            transition_name = name
+            ok, message = jira_service.transition_issue(release_key, name)
+            if ok:
+                break
+
     return {
         "success": ok,
         "release_key": release_key,
@@ -250,10 +282,10 @@ def run_rqg_check(
             )
         else:
             lines.append(
-                f"ℹ️ Jira-кнопка RQG не нажата "
+                f"⚠️ Jira-кнопка RQG не нажата "
                 f"('{trigger_result['transition_name']}'): {trigger_result['message']}"
             )
-            lines.append("   Это нормально, если RQG — системная кнопка. Анализ продолжается.")
+            lines.append("   Анализ продолжен автоматически, но переход в Jira не сработал.")
         lines.append("")
 
     result = analyze_rqg_for_release(jira_service=jira_service, release_key=release_key, max_depth=max_depth)

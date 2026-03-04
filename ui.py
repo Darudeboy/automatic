@@ -418,14 +418,14 @@ class BlastAIAssistant:
             except Exception as e: return f"Ошибка проверки LT: {e}"
 
         @tool("check_rqg")
-        def check_rqg(release_key: str, max_depth: int = 2, trigger_button: bool = False) -> str:
+        def check_rqg(release_key: str, max_depth: int = 2, trigger_button: bool = True) -> str:
             """
             Выполнить RQG-проверку релиза: статусы задач, наличие БТ, дистрибутивы.
 
             Args:
                 release_key: Ключ релиза Jira (например, HRPRELEASE-111135).
                 max_depth: Глубина обхода связанных задач (обычно 2).
-                trigger_button: Попробовать нажать системную кнопку RQG в Jira (False по умолчанию).
+                trigger_button: Попробовать нажать системную кнопку RQG в Jira (True по умолчанию).
             """
             release_key = (release_key or "").strip().upper()
             if not release_key:
@@ -547,7 +547,7 @@ class BlastAIAssistant:
                     self.app_gui.jira_service,
                     issue_key,
                     max_depth=2,
-                    trigger_button=False,
+                    trigger_button=True,
                 )
                 result_lines.append("3) RQG-проверка: выполнена")
                 rqg_lines = []
@@ -2130,7 +2130,7 @@ class ModernJiraApp(ctk.CTk):
                     self.jira_service,
                     release_key,
                     max_depth=2,
-                    trigger_button=False,
+                    trigger_button=True,
                 )
 
                 def show_report():
