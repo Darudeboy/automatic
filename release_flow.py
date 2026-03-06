@@ -285,6 +285,24 @@ def _is_recommendation_by_display_name(
     return _contains_any(_value_to_text(value), approved_keywords)
 
 
+def _is_recommendation_in_rendered(
+    release_issue: dict,
+    label_patterns: List[str],
+    approved_keywords: List[str],
+) -> bool:
+    rendered = release_issue.get("renderedFields", {}) or {}
+    html_blob = str(rendered).lower()
+    for label in label_patterns or []:
+        label_norm = _norm(label)
+        if not label_norm:
+            continue
+        # Допускаем "лейбл ... значение" в пределах одного визуального блока.
+        pattern = rf"{re.escape(label_norm)}.{0,250}({'|'.join(re.escape(_norm(k)) for k in approved_keywords if _norm(k))})"
+        if re.search(pattern, html_blob, flags=re.IGNORECASE | re.DOTALL):
+            return True
+    return False
+
+
 def _evaluate_story(jira_service, story_key: str, story_issue: dict, profile: dict) -> Dict[str, Any]:
     story_rules = profile.get("story_rules", {})
     done_statuses = profile.get("done_statuses", [])
@@ -571,12 +589,30 @@ def evaluate_release_gates(
         display_keywords=testing_tab.get("nt_display_keywords", []),
         approved_keywords=testing_tab.get("nt_approved_keywords", []),
     )
+    if not nt_recommendation_ok:
+        nt_recommendation_ok = _is_recommendation_in_rendered(
+            release,
+            testing_tab.get("nt_display_keywords", []),
+            testing_tab.get("nt_approved_keywords", []),
+        )
     dt_recommendation_ok = _is_recommendation_by_display_name(
         release,
         field_name_map=field_name_map,
         display_keywords=testing_tab.get("dt_display_keywords", []),
         approved_keywords=testing_tab.get("dt_approved_keywords", []),
     )
+    if not dt_recommendation_ok:
+        dt_recommendation_ok = _is_recommendation_in_rendered(
+            release,
+            testing_tab.get("dt_display_keywords", []),
+            testing_tab.get("dt_approved_keywords", []),
+        )
+    if not recommendation_ok:
+        recommendation_ok = _is_recommendation_in_rendered(
+            release,
+            testing_tab.get("ift_display_keywords", []),
+            testing_tab.get("ift_approved_keywords", []),
+        )
 
     qgm_ok, qgm_message, qgm_payload = jira_service.get_qgm_status(safe_release)
 
