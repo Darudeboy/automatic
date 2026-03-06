@@ -181,10 +181,10 @@ class BlastAIAssistant:
             "check_release_tasks_pr_status": ["release_key"],
             "link_tasks_to_release": ["release_key", "fix_version"],
             "link_issues_by_fix_version": ["release_key", "fix_version"],
-            "start_release_guided_cycle": ["release_key", "profile"],
-            "run_next_release_step": ["release_key"],
+            "start_release_guided_cycle": ["release_key", "profile", "dry_run"],
+            "run_next_release_step": ["release_key", "dry_run"],
             "confirm_manual_check": ["release_key", "check_id", "result"],
-            "move_release_if_ready": ["release_key"],
+            "move_release_if_ready": ["release_key", "dry_run"],
         }
 
         tool_calls = []
@@ -665,13 +665,14 @@ class BlastAIAssistant:
             )
 
         @tool("start_release_guided_cycle")
-        def start_release_guided_cycle(release_key: str, profile: str = "auto") -> str:
+        def start_release_guided_cycle(release_key: str, profile: str = "auto", dry_run: bool = False) -> str:
             """
             Запускает пошаговый Guided Cycle для полного релизного процесса.
 
             Args:
                 release_key: Ключ релиза Jira (например, HRPRELEASE-113937).
                 profile: Профиль правил ('auto', 'default', 'hotfix' или кастомный).
+                dry_run: Если True, только оценка/отчет без реального перевода статусов.
             """
             release_key = (release_key or "").strip().upper()
             profile = (profile or "auto").strip().lower()
@@ -680,11 +681,12 @@ class BlastAIAssistant:
             return self.app_gui.start_release_guided_cycle(
                 release_key=release_key,
                 profile=profile,
+                dry_run=dry_run,
                 announce_in_chat=True,
             )
 
         @tool("run_next_release_step")
-        def run_next_release_step(release_key: str) -> str:
+        def run_next_release_step(release_key: str, dry_run: bool = False) -> str:
             """
             Выполняет следующий шаг guided-цикла для релиза:
             переоценивает гейты и возвращает, что блокирует следующий переход.
@@ -694,6 +696,7 @@ class BlastAIAssistant:
                 return "Ошибка: не передан release_key."
             return self.app_gui.run_next_release_step(
                 release_key=release_key,
+                dry_run=dry_run,
                 announce_in_chat=True,
             )
 
@@ -722,7 +725,7 @@ class BlastAIAssistant:
             )
 
         @tool("move_release_if_ready")
-        def move_release_if_ready(release_key: str) -> str:
+        def move_release_if_ready(release_key: str, dry_run: bool = False) -> str:
             """
             Переводит релиз в следующий статус workflow, если все auto/manual гейты пройдены.
             """
@@ -731,6 +734,7 @@ class BlastAIAssistant:
                 return "Ошибка: не передан release_key."
             return self.app_gui.move_release_if_ready(
                 release_key=release_key,
+                dry_run=dry_run,
                 announce_in_chat=True,
             )
 
@@ -776,10 +780,10 @@ class BlastAIAssistant:
                 "9) check_release_tasks_pr_status(release_key) — Story/Bug + PR статусы (Open/Merged).\\n\\n"
                 "10) link_tasks_to_release(release_key, fix_version) — привязка задач fixVersion к релизу.\\n\\n"
                 "11) link_issues_by_fix_version(release_key, fix_version) — алиас привязки задач к релизу.\\n\\n"
-                "12) start_release_guided_cycle(release_key, profile='auto') — запуск пошагового полного цикла релиза.\\n"
-                "13) run_next_release_step(release_key) — переоценка следующего шага в guided cycle.\\n"
+                "12) start_release_guided_cycle(release_key, profile='auto', dry_run=False) — запуск пошагового полного цикла релиза.\\n"
+                "13) run_next_release_step(release_key, dry_run=False) — переоценка следующего шага в guided cycle.\\n"
                 "14) confirm_manual_check(release_key, check_id, result) — подтвердить ручную проверку (ok/fail).\\n"
-                "15) move_release_if_ready(release_key) — сдвиг в следующий статус только при пройденных гейтах.\\n\\n"
+                "15) move_release_if_ready(release_key, dry_run=False) — сдвиг в следующий статус только при пройденных гейтах.\\n\\n"
                 "ПРАВИЛА ВЫЗОВА:\\n"
                 "- Если пользователь просит действие, сначала вызови соответствующий инструмент, не выдумывай результат.\\n"
                 "- При нехватке обязательных аргументов ЗАДАЙ УТОЧНЯЮЩИЙ ВОПРОС и не вызывай инструмент.\\n"
@@ -794,6 +798,7 @@ class BlastAIAssistant:
                 "- Если пользователь просит 'проставь архитектуру для сторей в релизе' (и аналоги), "
                 "вызови update_architecture_status(release_key).\\n"
                 "- Если пользователь просит полный релизный цикл, сначала вызови start_release_guided_cycle.\\n"
+                "- Для безопасной проверки без изменений используй dry_run=True в guided инструментах.\\n"
                 "- Для ручных проверок НЕ придумывай подтверждения: попроси confirm_manual_check с check_id и result.\\n"
                 "- Если пользователь просит несколько действий, верни несколько отдельных JSON-словарей вызова инструментов подряд.\\n"
                 "- Не используй массив commands, не группируй вызовы в один объект.\\n"
@@ -1065,12 +1070,15 @@ class BlastAIAssistant:
         if guided_intent and release_match:
             release_key = release_match.group(1).upper()
             profile = "hotfix" if "hotfix" in lowered else "auto"
+            dry_run = "dry-run" in lowered or "dry run" in lowered or "тестовый прогон" in lowered
             self.app_gui.append_ai_chat(
-                f"🛠️ [Агент] Прямая команда: запуск guided cycle для {release_key} (profile={profile})\n"
+                f"🛠️ [Агент] Прямая команда: запуск guided cycle для {release_key} "
+                f"(profile={profile}, dry_run={dry_run})\n"
             )
             result = self.app_gui.start_release_guided_cycle(
                 release_key=release_key,
                 profile=profile,
+                dry_run=dry_run,
                 announce_in_chat=True,
             )
             self.app_gui.append_ai_chat(f"🤖 Blast AI: {result}\n\n")
@@ -1082,8 +1090,10 @@ class BlastAIAssistant:
         )
         if next_step_intent and release_match:
             release_key = release_match.group(1).upper()
+            dry_run = "dry-run" in lowered or "dry run" in lowered or "тестовый прогон" in lowered
             result = self.app_gui.run_next_release_step(
                 release_key=release_key,
+                dry_run=dry_run,
                 announce_in_chat=True,
             )
             self.app_gui.append_ai_chat(f"🤖 Blast AI: {result}\n\n")
@@ -1126,8 +1136,10 @@ class BlastAIAssistant:
         )
         if move_if_ready_intent and release_match:
             release_key = release_match.group(1).upper()
+            dry_run = "dry-run" in lowered or "dry run" in lowered or "тестовый прогон" in lowered
             result = self.app_gui.move_release_if_ready(
                 release_key=release_key,
+                dry_run=dry_run,
                 announce_in_chat=True,
             )
             self.app_gui.append_ai_chat(f"🤖 Blast AI: {result}\n\n")
@@ -2283,9 +2295,20 @@ class ModernJiraApp(ctk.CTk):
         if not release_key:
             messagebox.showwarning("Ошибка", "Введите ключ релиза!")
             return
-        self.start_release_guided_cycle(release_key=release_key, profile="auto", announce_in_chat=False)
+        self.start_release_guided_cycle(
+            release_key=release_key,
+            profile="auto",
+            dry_run=bool(self.dry_run_var.get()),
+            announce_in_chat=False,
+        )
 
-    def start_release_guided_cycle(self, release_key: str, profile: str = "auto", announce_in_chat: bool = False) -> str:
+    def start_release_guided_cycle(
+        self,
+        release_key: str,
+        profile: str = "auto",
+        dry_run: bool = False,
+        announce_in_chat: bool = False,
+    ) -> str:
         safe_release = (release_key or "").strip().upper()
         safe_profile = (profile or "auto").strip().lower()
         if not safe_release:
@@ -2295,20 +2318,20 @@ class ModernJiraApp(ctk.CTk):
         self.after(0, lambda: self.results_text.delete("1.0", "end"))
         self.after(0, lambda: self.progress_bar.set(0))
         self.after(0, lambda: self.update_status(f"Guided cycle: {safe_release}"))
-        self.after(0, lambda: self.details_label.configure(text=f"Профиль: {safe_profile}"))
+        self.after(0, lambda: self.details_label.configure(text=f"Профиль: {safe_profile} | dry_run={dry_run}"))
 
         worker = threading.Thread(
             target=self._guided_cycle_thread,
-            args=(safe_release, safe_profile, announce_in_chat),
+            args=(safe_release, safe_profile, dry_run, announce_in_chat),
             daemon=True,
         )
         worker.start()
         return (
-            f"Запущен guided cycle для {safe_release} (profile={safe_profile}). "
+            f"Запущен guided cycle для {safe_release} (profile={safe_profile}, dry_run={dry_run}). "
             "Результаты и блокировки будут показаны в Мониторинге."
         )
 
-    def _guided_cycle_thread(self, release_key: str, profile: str, announce_in_chat: bool):
+    def _guided_cycle_thread(self, release_key: str, profile: str, dry_run: bool, announce_in_chat: bool):
         try:
             result = evaluate_release_gates(
                 jira_service=self.jira_service,
@@ -2328,6 +2351,7 @@ class ModernJiraApp(ctk.CTk):
             if result.get("success"):
                 self.guided_cycle_context[release_key] = {
                     "profile": result.get("profile_name", profile),
+                    "dry_run": dry_run,
                     "last_result": result,
                     "manual_confirmations": (
                         self.guided_cycle_context.get(release_key, {}) or {}
@@ -2338,6 +2362,7 @@ class ModernJiraApp(ctk.CTk):
                     {
                         "release": release_key,
                         "profile": result.get("profile_name", profile),
+                        "dry_run": dry_run,
                         "ready_for_transition": result.get("ready_for_transition", False),
                     },
                 )
@@ -2354,15 +2379,17 @@ class ModernJiraApp(ctk.CTk):
             if announce_in_chat:
                 self.append_ai_chat(f"⚠️ {error_text}\n\n")
 
-    def run_next_release_step(self, release_key: str, announce_in_chat: bool = False) -> str:
+    def run_next_release_step(self, release_key: str, dry_run: bool = False, announce_in_chat: bool = False) -> str:
         safe_release = (release_key or "").strip().upper()
         if not safe_release:
             return "Ошибка: release_key не указан."
         context = self.guided_cycle_context.get(safe_release, {})
         profile = context.get("profile", "auto")
+        effective_dry_run = context.get("dry_run", dry_run)
         return self.start_release_guided_cycle(
             release_key=safe_release,
             profile=profile,
+            dry_run=effective_dry_run,
             announce_in_chat=announce_in_chat,
         )
 
@@ -2401,7 +2428,7 @@ class ModernJiraApp(ctk.CTk):
         )
         return message
 
-    def move_release_if_ready(self, release_key: str, announce_in_chat: bool = False) -> str:
+    def move_release_if_ready(self, release_key: str, dry_run: bool = False, announce_in_chat: bool = False) -> str:
         safe_release = (release_key or "").strip().upper()
         if not safe_release:
             return "Ошибка: release_key не указан."
@@ -2411,6 +2438,7 @@ class ModernJiraApp(ctk.CTk):
             result = evaluate_release_gates(self.jira_service, safe_release, "auto")
             context = {
                 "profile": result.get("profile_name", "auto"),
+                "dry_run": dry_run,
                 "last_result": result,
                 "manual_confirmations": {},
             }
@@ -2421,14 +2449,27 @@ class ModernJiraApp(ctk.CTk):
             report = format_release_gate_report(last_result)
             return (
                 "Переход заблокирован: не пройдены все гейты.\n"
-                f"{report}"
+                f"{report}\n"
+                f"Подтверди ручной чек: confirm_manual_check({safe_release}, <check_id>, ok)"
             )
 
         next_status = last_result.get("next_allowed_transition")
+        next_transition_id = last_result.get("next_allowed_transition_id")
         if not next_status:
             return "Релиз уже в финальном статусе или следующий этап не определен."
 
-        ok, msg = self.jira_service.transition_issue(safe_release, next_status)
+        effective_dry_run = context.get("dry_run", dry_run)
+        if effective_dry_run:
+            return (
+                f"[DRY-RUN] Релиз {safe_release} готов к переходу в '{next_status}'"
+                + (f" (transition id: {next_transition_id})" if next_transition_id else "")
+                + ". Фактический перевод не выполнен."
+            )
+
+        if next_transition_id:
+            ok, msg = self.jira_service.transition_issue_by_id(safe_release, next_transition_id)
+        else:
+            ok, msg = self.jira_service.transition_issue(safe_release, next_status)
         if not ok:
             return f"Не удалось перевести релиз: {msg}"
 
@@ -2442,6 +2483,7 @@ class ModernJiraApp(ctk.CTk):
         self.start_release_guided_cycle(
             release_key=safe_release,
             profile=context.get("profile", "auto"),
+            dry_run=effective_dry_run,
             announce_in_chat=announce_in_chat,
         )
         return f"Релиз {safe_release} переведен в '{next_status}'. Переоцениваю следующий шаг."

@@ -30,9 +30,17 @@ def _default_profile() -> Dict[str, Any]:
             "Стабилизация",
             "Готов к ПСИ",
             "ПСИ",
-            "Готов к установке",
-            "Установлен на ПРОМ",
+            "Согласование ППСИ",
+            "Утверждение ППСИ",
         ],
+        "transition_ids": {
+            "Готов к стабилизации": "15903",
+            "Стабилизация": "15904",
+            "Готов к ПСИ": "15307",
+            "ПСИ": "10105",
+            "Согласование ППСИ": "16311",
+            "Утверждение ППСИ": "16312",
+        },
         "done_statuses": [
             "Done",
             "Closed",
@@ -46,15 +54,39 @@ def _default_profile() -> Dict[str, Any]:
         },
         "bug_rules": {
             "ct_ift_keywords": ["ct", "ift", "ифт"],
+            "ct_ift_allowed_statuses": ["Закрыт", "Закрыто", "Closed"],
             "prom_keywords": ["пром", "prom"],
             "prom_expected_statuses": ["Подтверждение выполнения", "Done", "Closed", "Resolved", "Выполнено"],
         },
         "testing_tab": {
-            "recommendation_fields": _split_csv(
-                os.getenv("RELEASE_FLOW_RECOMMENDATION_FIELDS", ""),
+            "ift_recommendation_fields": _split_csv(
+                os.getenv("RELEASE_FLOW_IFT_RECOMMENDATION_FIELDS", ""),
                 ["customfield_ift_recommendation", "customfield_recommendation"],
             ),
-            "recommended_keyword": os.getenv("RELEASE_FLOW_RECOMMENDED_KEYWORD", "рекомендован"),
+            "ift_display_keywords": _split_csv(
+                os.getenv("RELEASE_FLOW_IFT_DISPLAY_KEYWORDS", ""),
+                ["рекомендация по отчету ифт", "recommendation ift", "ифт"],
+            ),
+            "ift_approved_keywords": _split_csv(
+                os.getenv("RELEASE_FLOW_IFT_APPROVED_KEYWORDS", ""),
+                ["рекомендован", "recommended"],
+            ),
+            "nt_display_keywords": _split_csv(
+                os.getenv("RELEASE_FLOW_NT_DISPLAY_KEYWORDS", ""),
+                ["рекомендация нт", "нагрузоч", "performance recommendation"],
+            ),
+            "nt_approved_keywords": _split_csv(
+                os.getenv("RELEASE_FLOW_NT_APPROVED_KEYWORDS", ""),
+                ["не требуется", "рекомендован", "версия 2 рекомендован", "not required", "recommended"],
+            ),
+            "dt_display_keywords": _split_csv(
+                os.getenv("RELEASE_FLOW_DT_DISPLAY_KEYWORDS", ""),
+                ["рекомендация дт", "dt recommendation"],
+            ),
+            "dt_approved_keywords": _split_csv(
+                os.getenv("RELEASE_FLOW_DT_APPROVED_KEYWORDS", ""),
+                ["рекомендован", "recommended"],
+            ),
             "green_keywords": _split_csv(
                 os.getenv("RELEASE_FLOW_RECOMMENDED_GREEN_KEYWORDS", ""),
                 ["green", "success", "status-lozenge-success", "aui-lozenge-success"],
@@ -91,19 +123,22 @@ def _default_profile() -> Dict[str, Any]:
                 "id": "load_test_subtask",
                 "title": "Подзадача нагрузочного тестирования",
                 "keywords": ["нагрузоч", "load test", "performance test"],
-                "required_statuses": ["Выполнено", "Выполнен", "Закрыто", "Закрыт", "Done", "Closed"],
+                "required_statuses": ["Закрыто", "Закрыт", "Closed"],
+                "required": True,
             },
             {
                 "id": "author_supervision_subtask",
                 "title": "Подзадача авторского надзора",
                 "keywords": ["авторск", "author supervision"],
-                "required_statuses": ["Выполнено", "Выполнен", "Закрыто", "Закрыт", "Done", "Closed"],
+                "required_statuses": ["Закрыто", "Закрыт", "Closed"],
+                "required": True,
             },
             {
                 "id": "translations_subtask",
                 "title": "Подзадача проверки переводов",
                 "keywords": ["перевод", "translation"],
-                "required_statuses": ["Выполнено", "Выполнен", "Закрыто", "Закрыт", "Done", "Closed"],
+                "required_statuses": ["Закрыто", "Закрыт", "Closed"],
+                "required": True,
             },
         ],
     }

@@ -27,6 +27,12 @@ def _status_in(status: str, allowed_statuses: List[str]) -> bool:
     return False
 
 
+def _status_exact_in(status: str, allowed_statuses: List[str]) -> bool:
+    status_norm = _norm(status)
+    allowed = {_norm(item) for item in (allowed_statuses or [])}
+    return status_norm in allowed
+
+
 def _extract_issue_text(issue: dict) -> str:
     fields = issue.get("fields", {}) or {}
     summary = str(fields.get("summary", ""))
@@ -218,11 +224,16 @@ def _is_ift_recommended(release_issue: dict, profile: dict) -> bool:
     fields = release_issue.get("fields", {}) or {}
     rendered = release_issue.get("renderedFields", {}) or {}
     tab = profile.get("testing_tab", {})
-    candidates = tab.get("recommendation_fields", [])
+    candidates = tab.get("ift_recommendation_fields", [])
 
     value = _find_issue_value_by_candidates(fields, candidates)
     if value is None:
         value = _find_issue_value_by_candidates(rendered, candidates)
+    if value is None:
+        value = _find_field_value_by_display_name(
+            release_issue,
+            tab.get("ift_display_keywords", []),
+        )
     if value is None:
         blob = _flatten_issue_fields(release_issue).lower()
         has_label = "ифт" in blob or "ift" in blob
@@ -247,11 +258,31 @@ def _is_ift_recommended(release_issue: dict, profile: dict) -> bool:
         ):
             return True
         return False
-    keyword = tab.get("recommended_keyword", "рекомендован")
+    keyword = (tab.get("ift_approved_keywords") or ["рекомендован"])[0]
     value_str = str(value)
     if _contains_any(value_str, [keyword]):
         return True
-    return _contains_any(value_str, ["рекоменд", "recommended"])
+    return _contains_any(value_str, tab.get("ift_approved_keywords", ["рекоменд", "recommended"]))
+
+
+def _is_recommendation_by_display_name(
+    release_issue: dict,
+    field_name_map: Dict[str, str],
+    display_keywords: List[str],
+    approved_keywords: List[str],
+) -> bool:
+    value = _find_field_value_by_display_name(
+        release_issue,
+        display_keywords,
+        field_name_map=field_name_map,
+    )
+    if value is None:
+        blob = _flatten_issue_fields(release_issue).lower()
+        has_marker = any(_norm(k) in blob for k in (display_keywords or []))
+        if has_marker:
+            return _contains_any(blob, approved_keywords)
+        return False
+    return _contains_any(_value_to_text(value), approved_keywords)
 
 
 def _evaluate_story(jira_service, story_key: str, story_issue: dict, profile: dict) -> Dict[str, Any]:
@@ -303,7 +334,6 @@ def _evaluate_story(jira_service, story_key: str, story_issue: dict, profile: di
 
 def _evaluate_bug(bug_key: str, bug_issue: dict, profile: dict) -> Dict[str, Any]:
     bug_rules = profile.get("bug_rules", {})
-    done_statuses = profile.get("done_statuses", [])
     text = f"{bug_key} {_extract_issue_text(bug_issue)}"
     status = _extract_issue_status(bug_issue)
 
@@ -311,9 +341,11 @@ def _evaluate_bug(bug_key: str, bug_issue: dict, profile: dict) -> Dict[str, Any
     reason = "ok"
 
     if _contains_any(text, bug_rules.get("ct_ift_keywords", [])):
-        if not _status_in(status, done_statuses):
+        # По ТЗ bug CT/IFT должен быть именно "Закрыт/Closed".
+        ct_ift_allowed = bug_rules.get("ct_ift_allowed_statuses", ["Закрыт", "Закрыто", "Closed"])
+        if not _status_exact_in(status, ct_ift_allowed):
             ok = False
-            reason = f"Для CT/IFT требуется закрытый статус, сейчас: {status}"
+            reason = f"Для CT/IFT требуется статус 'Закрыт/Closed', сейчас: {status}"
 
     if ok and _contains_any(text, bug_rules.get("prom_keywords", [])):
         prom_statuses = bug_rules.get("prom_expected_statuses", [])
@@ -343,6 +375,7 @@ def _evaluate_manual_subtasks(release_issue: dict, related_issues: List[dict], p
     for check in profile.get("manual_checks", []):
         keywords = check.get("keywords", [])
         required_statuses = check.get("required_statuses", [])
+        required = bool(check.get("required", False))
         if not keywords:
             pending.append(
                 {
@@ -360,13 +393,17 @@ def _evaluate_manual_subtasks(release_issue: dict, related_issues: List[dict], p
                 {
                     "id": check.get("id"),
                     "title": check.get("title"),
-                    "status": "optional_missing",
-                    "message": "Подзадача не найдена (проверь, требуется ли для проекта).",
+                    "status": "manual" if required else "optional_missing",
+                    "message": (
+                        "Подзадача не найдена, проверка блокирует переход."
+                        if required
+                        else "Подзадача не найдена (проверь, требуется ли для проекта)."
+                    ),
                 }
             )
             continue
 
-        bad = [item for item in matched if not _status_in(item.get("status", ""), required_statuses)]
+        bad = [item for item in matched if not _status_exact_in(item.get("status", ""), required_statuses)]
         if bad:
             pending.append(
                 {
@@ -440,6 +477,16 @@ def _next_transition(current_status: str, workflow_order: List[str]) -> Optional
     if idx >= len(workflow_order) - 1:
         return None
     return workflow_order[idx + 1]
+
+
+def _resolve_transition_id(profile: dict, next_status: Optional[str]) -> Optional[str]:
+    if not next_status:
+        return None
+    transition_ids = profile.get("transition_ids", {}) or {}
+    transition_id = transition_ids.get(next_status)
+    if transition_id is None:
+        return None
+    return str(transition_id)
 
 
 def evaluate_release_gates(
@@ -517,16 +564,21 @@ def evaluate_release_gates(
         field_name_map=field_name_map,
     )
     recommendation_ok = _is_ift_recommended(release, profile)
+    testing_tab = profile.get("testing_tab", {})
+    nt_recommendation_ok = _is_recommendation_by_display_name(
+        release,
+        field_name_map=field_name_map,
+        display_keywords=testing_tab.get("nt_display_keywords", []),
+        approved_keywords=testing_tab.get("nt_approved_keywords", []),
+    )
+    dt_recommendation_ok = _is_recommendation_by_display_name(
+        release,
+        field_name_map=field_name_map,
+        display_keywords=testing_tab.get("dt_display_keywords", []),
+        approved_keywords=testing_tab.get("dt_approved_keywords", []),
+    )
 
-    rqg_signals = _extract_rqg_comment_signals(jira_service.get_issue_comments(safe_release))
-    if rqg_signals.get("rqg_success"):
-        if rqg_signals.get("recommended_to_psi"):
-            recommendation_ok = True
-        # Если RQG в комментарии успешен и тестирование/дефекты в норме,
-        # считаем дистрибутивный блок пройденным.
-        if rqg_signals.get("testing_completed") and rqg_signals.get("no_critical_bugs"):
-            dist_link_ok = True
-            dist_registered_ok = True
+    qgm_ok, qgm_message, qgm_payload = jira_service.get_qgm_status(safe_release)
 
     # Дополнительный fallback:
     # если дистрибутив оформлен как отдельная связанная задача со статусом "Утвержден",
@@ -557,6 +609,34 @@ def evaluate_release_gates(
     }
     (auto_passed if recommendation_gate["ok"] else auto_failed).append(recommendation_gate)
 
+    nt_gate = {
+        "id": "nt_recommendation",
+        "title": "Рекомендация НТ",
+        "ok": nt_recommendation_ok,
+        "details": {"recommended": nt_recommendation_ok},
+    }
+    (auto_passed if nt_gate["ok"] else auto_failed).append(nt_gate)
+
+    dt_gate = {
+        "id": "dt_recommendation",
+        "title": "Рекомендация ДТ",
+        "ok": dt_recommendation_ok,
+        "details": {"recommended": dt_recommendation_ok},
+    }
+    (auto_passed if dt_gate["ok"] else auto_failed).append(dt_gate)
+
+    rqg_gate = {
+        "id": "rqg_qgm",
+        "title": "RQG (qgm endpoint)",
+        "ok": qgm_ok,
+        "details": {
+            "ok": qgm_ok,
+            "message": qgm_message,
+            "payload_preview": str(qgm_payload or {})[:400],
+        },
+    }
+    (auto_passed if rqg_gate["ok"] else auto_failed).append(rqg_gate)
+
     manual_raw = _evaluate_manual_subtasks(release, related_issues, profile)
     manual_pending = [item for item in manual_raw if item.get("status") != "optional_missing"]
     manual_optional = [item for item in manual_raw if item.get("status") == "optional_missing"]
@@ -574,6 +654,7 @@ def evaluate_release_gates(
 
     current_status = _extract_issue_status(release)
     next_status = _next_transition(current_status, profile.get("workflow_order", []))
+    next_transition_id = _resolve_transition_id(profile, next_status)
 
     ready_for_transition = len(auto_failed) == 0 and len(manual_pending) == 0 and bool(next_status)
 
@@ -584,6 +665,7 @@ def evaluate_release_gates(
         "profile_name": profile.get("name", "default"),
         "current_stage": current_status,
         "next_allowed_transition": next_status,
+        "next_allowed_transition_id": next_transition_id,
         "ready_for_transition": ready_for_transition,
         "auto_passed": auto_passed,
         "auto_failed": auto_failed,
@@ -592,7 +674,7 @@ def evaluate_release_gates(
         "manual_done": manual_done,
         "story_results": story_results,
         "bug_results": bug_results,
-        "rqg_comment_signals": rqg_signals,
+        "rqg_qgm": {"ok": qgm_ok, "message": qgm_message, "payload": qgm_payload or {}},
     }
 
 
@@ -607,8 +689,11 @@ def format_release_gate_report(result: Dict[str, Any]) -> str:
     lines.append(f"Профиль: {result.get('profile_name')} | Проект: {result.get('project_key')}")
     lines.append(f"Текущий этап: {result.get('current_stage')}")
     lines.append(f"Следующий этап: {result.get('next_allowed_transition') or 'нет'}")
-    if result.get("rqg_comment_signals", {}).get("rqg_success"):
-        lines.append("RQG в комментариях: найден успешный результат")
+    if result.get("next_allowed_transition_id"):
+        lines.append(f"Transition ID: {result.get('next_allowed_transition_id')}")
+    rqg_qgm = result.get("rqg_qgm", {}) or {}
+    if rqg_qgm.get("ok"):
+        lines.append("RQG qgm: успешно")
     lines.append("")
 
     lines.append(f"✅ Авто-гейты пройдены: {len(result.get('auto_passed', []))}")
@@ -617,11 +702,29 @@ def format_release_gate_report(result: Dict[str, Any]) -> str:
     lines.append(f"❌ Авто-гейты провалены: {len(result.get('auto_failed', []))}")
     for gate in result.get("auto_failed", []):
         lines.append(f"  - {gate.get('title')}: {gate.get('details')}")
+        gate_id = gate.get("id")
+        if gate_id == "distribution_tab":
+            lines.append("    Что сделать: проверь поля 'Ссылка на дистрибутив' и 'КЭ дистрибутива'.")
+        elif gate_id == "testing_recommendation":
+            lines.append("    Что сделать: в релизе должна быть рекомендация ИФТ = 'Рекомендован'.")
+        elif gate_id == "nt_recommendation":
+            lines.append("    Что сделать: НТ должна быть 'Не требуется' или 'Версия 2 РЕКОМЕНДОВАН'.")
+        elif gate_id == "dt_recommendation":
+            lines.append("    Что сделать: ДТ должна быть 'РЕКОМЕНДОВАН'.")
+        elif gate_id == "rqg_qgm":
+            lines.append("    Что сделать: проверь ответ /rest/release/1/qgm по issueId релиза.")
+        elif gate_id == "story_bug_quality":
+            lines.append("    Что сделать: закрой bug CT/IFT (только статус 'Закрыт/Closed').")
     lines.append("")
 
     lines.append(f"📝 Ручные проверки pending: {len(result.get('manual_pending', []))}")
     for check in result.get("manual_pending", []):
         lines.append(f"  - {check.get('id')}: {check.get('message')}")
+    if result.get("manual_pending"):
+        lines.append("  Подтвердить вручную можно командой:")
+        lines.append(
+            f"  confirm_manual_check({result.get('release_key')}, <check_id>, ok)"
+        )
     if result.get("manual_done"):
         lines.append(f"✅ Подтверждено вручную: {len(result.get('manual_done', []))}")
         for check in result.get("manual_done", []):

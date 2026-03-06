@@ -180,63 +180,18 @@ def analyze_rqg_for_release(jira_service, release_key: str, max_depth: int = 2) 
 
 
 def trigger_rqg_button(jira_service, release_key: str, button_name: Optional[str] = None) -> Dict:
-    """Нажимает кнопку/переход RQG в Jira на релизной задаче."""
-    comalarest_success = 0
-    comalarest_failed: List[str] = []
-    linked_issues = jira_service.get_linked_issues(release_key)
-    for linked_key in linked_issues:
-        ok_call, call_msg = jira_service.trigger_rqg_status(
-            issue_key=release_key,
-            linked_issue_key=linked_key,
-            is_full_info=False,
-        )
-        if ok_call:
-            comalarest_success += 1
-        else:
-            comalarest_failed.append(call_msg)
-
-    raw_candidates = os.getenv(
-        "RQG_TRANSITION_NAMES",
-        os.getenv("RQG_TRANSITION_NAME", "RQG,Проверка RQG,Проверки RQG,Run RQG"),
-    )
-    if button_name and button_name.strip():
-        candidates = [button_name.strip()]
-    else:
-        candidates = [item.strip() for item in raw_candidates.split(",") if item.strip()]
-        if not candidates:
-            candidates = ["RQG"]
-
-    ok = False
-    message = "Кнопка RQG не найдена"
-    transition_name = candidates[0]
-    for candidate in candidates:
-        transition_name = candidate
-        ok, message = jira_service.transition_issue(release_key, candidate)
-        if ok:
-            break
-
-    if not ok:
-        # Fallback: пробуем автопоиск по доступным переходам с 'rqg' в названии.
-        transitions = jira_service.get_available_transitions(release_key)
-        rqg_named = [
-            t.get("name", "")
-            for t in transitions
-            if "rqg" in (t.get("name", "") or "").lower()
-        ]
-        for name in rqg_named:
-            transition_name = name
-            ok, message = jira_service.transition_issue(release_key, name)
-            if ok:
-                break
-
+    """Проверяет RQG через qgm endpoint (источник истины)."""
+    safe_release = (release_key or "").strip().upper()
+    ok, message, payload = jira_service.get_qgm_status(safe_release)
+    payload_preview = ""
+    if isinstance(payload, dict):
+        payload_preview = str(payload)[:500]
     return {
-        "success": ok or comalarest_success > 0,
-        "release_key": release_key,
-        "transition_name": transition_name,
-        "message": (
-            f"{message}; comalarest_ok={comalarest_success}/{len(linked_issues)}"
-            + (f"; comalarest_errors={'; '.join(comalarest_failed[:5])}" if comalarest_failed else "")
-        ),
+        "success": ok,
+        "release_key": safe_release,
+        "transition_name": "QGM",
+        "message": f"{message}{'; payload=' + payload_preview if payload_preview else ''}",
+        "qgm_payload": payload or {},
     }
 
 
@@ -294,15 +249,15 @@ def run_rqg_check(
         trigger_result = trigger_rqg_button(jira_service, release_key, button_name=button_name)
         if trigger_result["success"]:
             lines.append(
-                f"✅ Jira-кнопка RQG нажата: {trigger_result['transition_name']} "
+                f"✅ RQG endpoint выполнен: {trigger_result['transition_name']} "
                 f"({trigger_result['release_key']})"
             )
         else:
             lines.append(
-                f"⚠️ Jira-кнопка RQG не нажата "
+                f"⚠️ RQG endpoint не выполнен "
                 f"('{trigger_result['transition_name']}'): {trigger_result['message']}"
             )
-            lines.append("   Анализ продолжен автоматически, но переход в Jira не сработал.")
+            lines.append("   Анализ продолжен автоматически, но RQG endpoint вернул ошибку.")
         lines.append("")
 
     result = analyze_rqg_for_release(jira_service=jira_service, release_key=release_key, max_depth=max_depth)

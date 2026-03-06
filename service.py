@@ -1,7 +1,7 @@
 import logging
-from urllib.parse import quote
 from typing import Dict, List, Optional, Tuple
 from atlassian import Jira
+import requests
 import warnings
 
 from config import JiraConfig
@@ -194,30 +194,64 @@ class JiraService:
             self.logger.error(f"Ошибка получения переходов для {issue_key}: {e}")
             return []
 
-    def trigger_rqg_status(self, issue_key: str, linked_issue_key: str, is_full_info: bool = False) -> Tuple[bool, str]:
+    def get_issue_id(self, issue_key: str) -> Optional[str]:
+        """Возвращает numeric issueId Jira для ключа задачи."""
+        safe_key = (issue_key or "").strip().upper()
+        if not safe_key:
+            return None
+        issue = self.get_issue_details(safe_key)
+        if not issue:
+            return None
+        issue_id = str(issue.get("id", "")).strip()
+        return issue_id or None
+
+    def get_qgm_status(self, issue_key: str) -> Tuple[bool, str, Optional[dict]]:
         """
-        Запуск/получение статуса RQG через comalarest endpoint.
-        Пример: /rest/comalarest/1.0/requirements/rqgstatus?issueId=HRPRELEASE-...&linkedIssueId=HRC-...&isFullInfo=false
+        Получение RQG-данных по endpoint:
+        /rest/release/1/qgm?issueId=<numeric_issue_id>
         """
         safe_issue = (issue_key or "").strip().upper()
-        safe_linked = (linked_issue_key or "").strip().upper()
-        if not safe_issue or not safe_linked:
-            return False, "Не указаны issue_key и/или linked_issue_key"
+        issue_id = self.get_issue_id(safe_issue)
+        if not issue_id:
+            return False, f"Не удалось определить issueId для {safe_issue}", None
+
+        endpoint = f"{self.config.url.rstrip('/')}/rest/release/1/qgm"
+        params = {"issueId": issue_id}
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.token}",
+        }
+
+        def _short_body(text: str, limit: int = 300) -> str:
+            body = (text or "").strip().replace("\n", " ")
+            if len(body) <= limit:
+                return body
+            return f"{body[: limit - 3]}..."
+
         try:
-            full_info = "true" if is_full_info else "false"
-            url = (
-                "/rest/comalarest/1.0/requirements/rqgstatus"
-                f"?issueId={quote(safe_issue)}"
-                f"&linkedIssueId={quote(safe_linked)}"
-                f"&isFullInfo={full_info}"
+            response = requests.get(
+                url=endpoint,
+                params=params,
+                headers=headers,
+                timeout=30,
+                verify=self.config.verify_ssl,
             )
-            response = self.jira.get(url)
-            return True, f"RQG endpoint ok for {safe_linked}: {response}"
+            if not (200 <= response.status_code < 300):
+                return False, f"QGM HTTP {response.status_code}: {_short_body(response.text)}", None
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if "application/json" in content_type:
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        return True, "QGM OK", payload
+                    return True, "QGM OK (non-dict JSON)", {"raw": payload}
+                except Exception:
+                    return True, "QGM OK (non-json body)", {"raw_text": response.text}
+            return True, "QGM OK (text body)", {"raw_text": response.text}
         except Exception as e:
-            self.logger.error(
-                f"Ошибка RQG endpoint для issue={safe_issue}, linked={safe_linked}: {e}"
-            )
-            return False, f"{safe_linked}: {e}"
+            self.logger.error("Ошибка QGM endpoint для issue=%s: %s", safe_issue, e)
+            return False, f"QGM request failed: {e}", None
 
     def transition_issue(self, issue_key: str, target_status: str) -> Tuple[bool, str]:
         """Перевод задачи в целевой статус по названию статуса"""
@@ -262,6 +296,25 @@ class JiraService:
         except Exception as e:
             self.logger.error(f"Ошибка перевода {issue_key} в '{target_status}': {e}")
             return False, f"Ошибка перевода статуса: {e}"
+
+    def transition_issue_by_id(self, issue_key: str, transition_id: str) -> Tuple[bool, str]:
+        """Перевод задачи по transition ID."""
+        safe_key = (issue_key or "").strip().upper()
+        safe_transition_id = str(transition_id or "").strip()
+        if not safe_key or not safe_transition_id:
+            return False, "Не указан issue_key или transition_id"
+        try:
+            response = self.jira.post(
+                f"/rest/api/2/issue/{safe_key}/transitions",
+                data={"transition": {"id": safe_transition_id}},
+                advanced_mode=True,
+            )
+            if response.status_code in (200, 204):
+                return True, f"{safe_key} переведена по transition id {safe_transition_id}"
+            return False, f"Jira вернул код {response.status_code} для transition id {safe_transition_id}"
+        except Exception as e:
+            self.logger.error(f"Ошибка перевода {safe_key} по transition id {safe_transition_id}: {e}")
+            return False, f"Ошибка перевода по transition id: {e}"
 
     @staticmethod
     def normalize_status(status: str) -> str:
