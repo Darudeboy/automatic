@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -245,8 +246,8 @@ def _is_ift_recommended(release_issue: dict, profile: dict) -> bool:
         # Дополнительный парсинг для rendered HTML:
         # "Рекомендация по отчету ИФТ ... Рекомендован".
         html_blob = str(release_issue.get("renderedFields", {})).lower()
-    html_blob = re.sub(r"<[^>]+>", " ", html_blob)
-    html_blob = re.sub(r"\s+", " ", html_blob)
+        html_blob = re.sub(r"<[^>]+>", " ", html_blob)
+        html_blob = re.sub(r"\s+", " ", html_blob)
         if re.search(
             r"рекомендац[а-я\s]*по\s*отчет[а-я\s]*ифт.{0,400}рекомендован",
             html_blob,
@@ -293,7 +294,14 @@ def _is_recommendation_in_rendered(
     approved_keywords: List[str],
 ) -> bool:
     rendered = release_issue.get("renderedFields", {}) or {}
-    html_blob = str(rendered).lower()
+    fields = release_issue.get("fields", {}) or {}
+    html_blob = " ".join(
+        [
+            str(rendered).lower(),
+            str(fields.get("customfield_sber_test_html", "")).lower(),
+            str(rendered.get("customfield_sber_test_html", "")).lower(),
+        ]
+    )
     html_blob = re.sub(r"<[^>]+>", " ", html_blob)
     html_blob = re.sub(r"\s+", " ", html_blob)
     for label in label_patterns or []:
@@ -397,7 +405,6 @@ def _evaluate_manual_subtasks(release_issue: dict, related_issues: List[dict], p
     for check in profile.get("manual_checks", []):
         keywords = check.get("keywords", [])
         required_statuses = check.get("required_statuses", [])
-        required = bool(check.get("required", False))
         if not keywords:
             pending.append(
                 {
@@ -415,12 +422,9 @@ def _evaluate_manual_subtasks(release_issue: dict, related_issues: List[dict], p
                 {
                     "id": check.get("id"),
                     "title": check.get("title"),
-                    "status": "manual" if required else "optional_missing",
-                    "message": (
-                        "Подзадача не найдена, проверка блокирует переход."
-                        if required
-                        else "Подзадача не найдена (проверь, требуется ли для проекта)."
-                    ),
+                    # Отсутствие подзадачи не блокирует; блокирует только найденная и незакрытая.
+                    "status": "optional_missing",
+                    "message": "Подзадача не найдена (проверь, требуется ли для проекта).",
                 }
             )
             continue
@@ -501,6 +505,24 @@ def _next_transition(current_status: str, workflow_order: List[str]) -> Optional
     return workflow_order[idx + 1]
 
 
+def _parse_http_status_from_text(text: str) -> Optional[int]:
+    match = re.search(r"HTTP\s+(\d{3})", text or "", re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _is_qgm_technical_error(message: str) -> bool:
+    msg = (message or "").lower()
+    if "request failed" in msg:
+        return True
+    status = _parse_http_status_from_text(message or "")
+    return status in {400, 401, 403, 404, 405, 429, 500, 502, 503, 504}
+
+
 def _resolve_transition_id(profile: dict, next_status: Optional[str]) -> Optional[str]:
     if not next_status:
         return None
@@ -527,6 +549,14 @@ def evaluate_release_gates(
     )
     if not release:
         return {"success": False, "message": f"Релиз {safe_release} не найден."}
+    release.setdefault("fields", {})
+    release.setdefault("renderedFields", {})
+
+    # Доп. источник правды по блокам ИФТ/НТ/ДТ.
+    sber_test_html = jira_service.get_sber_test_report(safe_release)
+    if sber_test_html:
+        release["fields"]["customfield_sber_test_html"] = sber_test_html
+        release["renderedFields"]["customfield_sber_test_html"] = sber_test_html
 
     release_project_key = str(release.get("fields", {}).get("project", {}).get("key", ""))
     profile = get_release_flow_profile(project_key=release_project_key, requested_profile=profile_name)
@@ -639,6 +669,25 @@ def evaluate_release_gates(
         )
 
     qgm_ok, qgm_message, qgm_payload = jira_service.get_qgm_status(safe_release)
+    rqg_actual_ok = False
+    if qgm_ok and isinstance(qgm_payload, dict):
+        rqg_info = qgm_payload.get("rqgInfo", {}) if isinstance(qgm_payload.get("rqgInfo", {}), dict) else {}
+        has_blockers = bool(
+            rqg_info.get("hasBlockDataRqg1")
+            or rqg_info.get("hasBlockDataRqg2")
+            or rqg_info.get("hasBlockDataRqg3")
+        )
+        to_comment = str(qgm_payload.get("toComment", "")).lower()
+        if not has_blockers and ("успешно" in to_comment or "success" in to_comment):
+            rqg_actual_ok = True
+        elif not has_blockers and rqg_info:
+            rqg_actual_ok = True
+
+    # Fallback: если endpoint недоступен, но в комментариях есть успех RQG — считаем пройденным.
+    if not rqg_actual_ok:
+        comment_signals = _extract_rqg_comment_signals(jira_service.get_issue_comments(safe_release))
+        if comment_signals.get("rqg_success"):
+            rqg_actual_ok = True
 
     # Дополнительный fallback:
     # если дистрибутив оформлен как отдельная связанная задача со статусом "Утвержден",
@@ -694,14 +743,22 @@ def evaluate_release_gates(
             rqg_actual_ok = True
         elif not has_blockers and rqg_info.get("hasIndicativeData"):
             rqg_actual_ok = True
+    enforce_qgm = _norm(os.getenv("RELEASE_FLOW_ENFORCE_QGM", "false")) in {"1", "true", "yes", "y", "да"}
+    rqg_warning_only = False
+    rqg_gate_ok = rqg_actual_ok
+    if not rqg_actual_ok and not enforce_qgm and _is_qgm_technical_error(qgm_message):
+        # Не блокируем релиз из-за технической недоступности plugin endpoint.
+        rqg_gate_ok = True
+        rqg_warning_only = True
 
     rqg_gate = {
         "id": "rqg_qgm",
         "title": "RQG (qgm endpoint)",
-        "ok": rqg_actual_ok,
+        "ok": rqg_gate_ok,
         "details": {
             "ok": rqg_actual_ok,
             "http_ok": qgm_ok,
+            "warning_only": rqg_warning_only,
             "message": qgm_message,
             "payload_preview": str(qgm_payload or {})[:400],
         },
@@ -770,7 +827,11 @@ def format_release_gate_report(result: Dict[str, Any]) -> str:
 
     lines.append(f"✅ Авто-гейты пройдены: {len(result.get('auto_passed', []))}")
     for gate in result.get("auto_passed", []):
-        lines.append(f"  - {gate.get('title')}")
+        details = gate.get("details") or {}
+        if gate.get("id") == "rqg_qgm" and details.get("warning_only"):
+            lines.append(f"  - {gate.get('title')} (warning: endpoint недоступен, не блокирует)")
+        else:
+            lines.append(f"  - {gate.get('title')}")
     lines.append(f"❌ Авто-гейты провалены: {len(result.get('auto_failed', []))}")
     for gate in result.get("auto_failed", []):
         lines.append(f"  - {gate.get('title')}: {gate.get('details')}")

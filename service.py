@@ -205,6 +205,42 @@ class JiraService:
         issue_id = str(issue.get("id", "")).strip()
         return issue_id or None
 
+    def get_sber_test_report(self, issue_key: str) -> str:
+        """
+        Получает HTML блока 'Отчет о тестировании' из plugin endpoint.
+        Используется как fallback, когда Jira fields/renderedFields не содержат нужные маркеры.
+        """
+        safe_key = (issue_key or "").strip().upper()
+        endpoint = (
+            f"{self.config.url.rstrip('/')}"
+            f"/rest/sber-test-report/1.0/sber-test-report/rqgiftstatushtml"
+        )
+        params = {"issueKey": safe_key}
+        headers = {
+            "Accept": "text/html, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "Authorization": f"Bearer {self.config.token}",
+        }
+        try:
+            response = requests.get(
+                endpoint,
+                params=params,
+                headers=headers,
+                timeout=20,
+                verify=self.config.verify_ssl,
+            )
+            if response.status_code == 200:
+                return response.text or ""
+            self.logger.error(
+                "sber-test-report HTTP %s for %s: %s",
+                response.status_code,
+                safe_key,
+                (response.text or "")[:200],
+            )
+        except Exception as e:
+            self.logger.error("Failed to fetch sber-test-report for %s: %s", safe_key, e)
+        return ""
+
     def get_qgm_status(self, issue_key: str) -> Tuple[bool, str, Optional[dict]]:
         """
         Получение RQG-данных по endpoint:
@@ -215,21 +251,13 @@ class JiraService:
         if not issue_id:
             return False, f"Не удалось определить issueId для {safe_issue}", None
 
-        base_url = self.config.url.rstrip("/")
-        endpoints = [
-            f"{base_url}/rest/release/1/qgm",
-            f"{base_url}/rest/release/1/qgm/",
-        ]
+        endpoint = f"{self.config.url.rstrip('/')}/rest/release/1/qgm"
         params = {"issueId": issue_id}
-        headers_get = {
+        headers = {
             "Accept": "application/json, text/plain, */*",
             "Authorization": f"Bearer {self.config.token}",
             "X-Requested-With": "XMLHttpRequest",
             "X-Atlassian-Token": "no-check",
-        }
-        headers_post = {
-            **headers_get,
-            "Content-Type": "application/json",
         }
 
         def _short_body(text: str, limit: int = 300) -> str:
@@ -238,60 +266,72 @@ class JiraService:
                 return body
             return f"{body[: limit - 3]}..."
 
-        errors: List[str] = []
-        for endpoint in endpoints:
-            # 1) GET (как в браузере)
-            try:
-                response = requests.get(
-                    url=endpoint,
-                    params=params,
-                    headers=headers_get,
-                    timeout=30,
-                    verify=self.config.verify_ssl,
-                )
-                if 200 <= response.status_code < 300:
-                    content_type = (response.headers.get("Content-Type") or "").lower()
-                    if "application/json" in content_type:
-                        try:
-                            payload = response.json()
-                            if isinstance(payload, dict):
-                                return True, "QGM OK (GET)", payload
-                            return True, "QGM OK (GET non-dict JSON)", {"raw": payload}
-                        except Exception:
-                            return True, "QGM OK (GET non-json body)", {"raw_text": response.text}
-                    return True, "QGM OK (GET text body)", {"raw_text": response.text}
-                errors.append(f"GET {endpoint} -> HTTP {response.status_code}: {_short_body(response.text)}")
-            except Exception as e:
-                errors.append(f"GET {endpoint} -> {e}")
+        try:
+            # 1) Приоритетно: POST с query params (как в ручном успешном сценарии Jira UI)
+            response = requests.post(
+                url=endpoint,
+                params=params,
+                headers=headers,
+                timeout=30,
+                verify=self.config.verify_ssl,
+            )
+            if 200 <= response.status_code < 300:
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        return True, "QGM OK (POST)", payload
+                except Exception:
+                    text = (response.text or "").strip()
+                    if text:
+                        return True, "QGM OK (POST non-json)", {"raw_text": text}
+                    return False, "QGM failed: POST returned empty non-json body", None
 
-            # 2) POST fallback (для инсталляций с другим маршрутом)
-            try:
-                response = requests.post(
-                    url=endpoint,
-                    params=params,
-                    json={"issueId": issue_id},
-                    headers=headers_post,
-                    timeout=30,
-                    verify=self.config.verify_ssl,
-                )
-                if 200 <= response.status_code < 300:
-                    content_type = (response.headers.get("Content-Type") or "").lower()
-                    if "application/json" in content_type:
-                        try:
-                            payload = response.json()
-                            if isinstance(payload, dict):
-                                return True, "QGM OK (POST)", payload
-                            return True, "QGM OK (POST non-dict JSON)", {"raw": payload}
-                        except Exception:
-                            return True, "QGM OK (POST non-json body)", {"raw_text": response.text}
-                    return True, "QGM OK (POST text body)", {"raw_text": response.text}
-                errors.append(f"POST {endpoint} -> HTTP {response.status_code}: {_short_body(response.text)}")
-            except Exception as e:
-                errors.append(f"POST {endpoint} -> {e}")
+            # 2) POST+JSON fallback.
+            response_json = requests.post(
+                url=endpoint,
+                params=params,
+                json={"issueId": int(issue_id)},
+                headers={**headers, "Content-Type": "application/json"},
+                timeout=30,
+                verify=self.config.verify_ssl,
+            )
+            if 200 <= response_json.status_code < 300:
+                try:
+                    payload = response_json.json()
+                    if isinstance(payload, dict):
+                        return True, "QGM OK (POST+JSON)", payload
+                except Exception:
+                    text = (response_json.text or "").strip()
+                    if text:
+                        return True, "QGM OK (POST+JSON non-json)", {"raw_text": text}
 
-        joined = " | ".join(errors[:6])
-        self.logger.error("Ошибка QGM endpoint для issue=%s: %s", safe_issue, joined)
-        return False, f"QGM failed: {joined}", None
+            # 3) GET fallback.
+            response_get = requests.get(
+                url=endpoint,
+                params=params,
+                headers=headers,
+                timeout=30,
+                verify=self.config.verify_ssl,
+            )
+            if 200 <= response_get.status_code < 300:
+                try:
+                    payload = response_get.json()
+                    if isinstance(payload, dict):
+                        return True, "QGM OK (GET)", payload
+                except Exception:
+                    text = (response_get.text or "").strip()
+                    if text:
+                        return True, "QGM OK (GET non-json)", {"raw_text": text}
+
+            return (
+                False,
+                f"QGM failed: POST HTTP {response.status_code}, POST+JSON HTTP {response_json.status_code}, "
+                f"GET HTTP {response_get.status_code}",
+                None,
+            )
+        except Exception as e:
+            self.logger.error("Ошибка QGM endpoint для issue=%s: %s", safe_issue, e)
+            return False, f"QGM failed: POST error: {e}", None
 
     def transition_issue(self, issue_key: str, target_status: str) -> Tuple[bool, str]:
         """Перевод задачи в целевой статус по названию статуса"""
