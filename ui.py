@@ -27,6 +27,7 @@ from release_pr_status import (
     format_release_tasks_pr_report,
 )
 from release_flow import evaluate_release_gates, format_release_gate_report
+from release_flow_config import get_release_flow_profile
 from arch import JIRA_TOKEN as ARCH_JIRA_TOKEN
 from master_analyzer import MasterServicesAnalyzer, ConfluenceDeployPlanGenerator
 
@@ -327,6 +328,14 @@ class BlastAIAssistant:
                 remaining = function_remaining
 
         return tool_calls, remaining.strip()
+
+    def _looks_like_raw_tool_payload(self, text: str) -> bool:
+        probe = (text or "").strip().lower()
+        if not probe:
+            return False
+        if probe.startswith("```json") or probe.startswith("{") or probe.startswith("["):
+            return True
+        return any(token in probe for token in ('"tool"', '"function"', '"commands"', '"args"', '"arguments"'))
 
     def _setup_graph(self):
         @tool("get_jira_status")
@@ -786,6 +795,8 @@ class BlastAIAssistant:
                 "15) move_release_if_ready(release_key, dry_run=False) — сдвиг в следующий статус только при пройденных гейтах.\\n\\n"
                 "ПРАВИЛА ВЫЗОВА:\\n"
                 "- Если пользователь просит действие, сначала вызови соответствующий инструмент, не выдумывай результат.\\n"
+                "- КРИТИЧНО: не пиши, что действие выполнено/успешно, пока не получен ToolMessage с результатом.\\n"
+                "- До получения ToolMessage допустимы только: уточняющий вопрос или сообщение 'выполняю команду'.\\n"
                 "- При нехватке обязательных аргументов ЗАДАЙ УТОЧНЯЮЩИЙ ВОПРОС и не вызывай инструмент.\\n"
                 "- Важные обязательные параметры: "
                 "issue_key/release_key в формате PROJECT-123, "
@@ -941,6 +952,51 @@ class BlastAIAssistant:
                 return True
 
         release_match = re.search(r"(HRPRELEASE-\d+)", raw, re.IGNORECASE)
+
+        move_status_match = re.search(
+            r"(?:переведи|перемести|сдвинь|move)\s+(HRPRELEASE-\d+)\s+(?:в|to)\s+(.+)$",
+            raw,
+            re.IGNORECASE,
+        )
+        if move_status_match and "workflow" not in lowered and "следующ" not in lowered:
+            issue_key = move_status_match.group(1).upper()
+            target_status = move_status_match.group(2).strip().strip("\"'`.,;: ")
+            if target_status:
+                self.app_gui.append_ai_chat(
+                    f"🛠️ [Агент] Прямая команда: перевод {issue_key} в '{target_status}'\n"
+                )
+                result = self.tools_map["move_release_status"].invoke(
+                    {"issue_key": issue_key, "target_status": target_status}
+                )
+                self.app_gui.append_ai_chat(f"🤖 Blast AI: {result}\n\n")
+                return True
+
+        next_workflow_intent = any(
+            phrase in lowered
+            for phrase in (
+                "следующий по workflow",
+                "в следующий по workflow статус",
+                "переведи в следующий статус по workflow",
+                "переведи в следущий статус по workflow",
+                "подвинь в следующий",
+                "подвинь в следующий по workflow статус",
+                "сдвинь в следующий",
+                "следующий статус",
+                "move to next workflow",
+                "next workflow status",
+            )
+        )
+        if next_workflow_intent:
+            release_key = release_match.group(1).upper() if release_match else self._extract_last_release_key_from_memory()
+            if not release_key:
+                self.app_gui.append_ai_chat(
+                    "🤖 Blast AI: Не вижу ключ релиза. Укажи его в формате HRPRELEASE-123456.\n\n"
+                )
+                return True
+            result = self._move_release_to_next_workflow_status(release_key)
+            self.app_gui.append_ai_chat(f"🤖 Blast AI: {result}\n\n")
+            return True
+
         version_match = re.search(
             r"(?:верси\w*|fix\s*version|fixversion)\s*[:=]?\s*([A-Z0-9._\-]+)",
             raw,
@@ -1202,6 +1258,76 @@ class BlastAIAssistant:
 
         return False
 
+    def _extract_last_release_key_from_memory(self) -> str | None:
+        for msg in reversed(self.memory):
+            content = str(getattr(msg, "content", "") or "")
+            match = re.search(r"(HRPRELEASE-\d+)", content, re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
+        return None
+
+    def _move_release_to_next_workflow_status(self, release_key: str) -> str:
+        safe_release = (release_key or "").strip().upper()
+        if not safe_release:
+            return "Ошибка: не передан release_key."
+
+        issue = self.app_gui.jira_service.get_issue_details(safe_release)
+        if not issue:
+            return f"Ошибка: релиз {safe_release} не найден."
+
+        current_status = str(issue.get("fields", {}).get("status", {}).get("name", "Unknown"))
+        project_key = str(issue.get("fields", {}).get("project", {}).get("key", "")).strip().upper()
+        profile = get_release_flow_profile(project_key=project_key)
+        workflow_order = profile.get("workflow_order", []) or []
+        transition_ids = profile.get("transition_ids", {}) or {}
+
+        def _norm(value: str) -> str:
+            return (value or "").strip().lower()
+
+        normalized = [_norm(item) for item in workflow_order]
+        current_norm = _norm(current_status)
+        if current_norm not in normalized:
+            return (
+                f"Ошибка: текущий статус '{current_status}' отсутствует в workflow профиля "
+                f"'{profile.get('name', 'default')}'."
+            )
+
+        idx = normalized.index(current_norm)
+        if idx >= len(workflow_order) - 1:
+            return f"Для релиза {safe_release} нет следующего статуса: уже конец workflow ({current_status})."
+
+        next_status = workflow_order[idx + 1]
+        transition_id = str(transition_ids.get(next_status) or "").strip() or None
+
+        ok, message = self.app_gui.jira_service.transition_issue(safe_release, next_status)
+        if not ok and transition_id:
+            ok, message = self.app_gui.jira_service.transition_issue_by_id(safe_release, transition_id)
+
+        if not ok:
+            transitions = self.app_gui.jira_service.get_available_transitions(safe_release)
+            available = ", ".join(t.get("name", "Unknown") for t in transitions) if transitions else "нет данных"
+            return (
+                f"❌ Не удалось перевести {safe_release} в следующий статус '{next_status}'.\n"
+                f"Текущий статус: {current_status}\n"
+                f"Ошибка Jira: {message}\n"
+                f"Доступные переходы: {available}"
+            )
+
+        refreshed = self.app_gui.jira_service.get_issue_details(safe_release) or {}
+        actual_status = str(refreshed.get("fields", {}).get("status", {}).get("name", "Unknown"))
+        self.app_gui.history.add(
+            "Смена статуса (AI workflow)",
+            {"release_key": safe_release, "from": current_status, "to": actual_status},
+        )
+        self.app_gui.history.save_to_file(self.app_gui.history_path)
+        return (
+            f"✅ Релиз {safe_release} переведен по workflow.\n"
+            f"Было: {current_status}\n"
+            f"Ожидали: {next_status}\n"
+            f"Стало: {actual_status}\n"
+            f"Jira: {message}"
+        )
+
     def process_message(self, text: str):
         
         if self._handle_direct_commands(text):
@@ -1210,6 +1336,7 @@ class BlastAIAssistant:
 
         self.memory.append(HumanMessage(content=text))
         try:
+            awaiting_tool_result = False
             for out in self.app_graph.stream({"messages": self.memory}):
                 if "agent" in out:
                     msg = out["agent"]["messages"][-1]
@@ -1217,10 +1344,25 @@ class BlastAIAssistant:
                     tool_calls = getattr(msg, "tool_calls", []) or []
                     if not tool_calls and (msg.content or "").strip():
                         tool_calls, _ = self._extract_tool_calls_from_text(msg.content)
-                    if (msg.content or "").strip() and not tool_calls:
+                    if tool_calls:
+                        awaiting_tool_result = True
+                        continue
+                    if (msg.content or "").strip():
+                        if self._looks_like_raw_tool_payload(msg.content):
+                            continue
                         self.app_gui.append_ai_chat(f"🤖 Blast AI: {msg.content}\\n\\n")
+                        awaiting_tool_result = False
                 if "action" in out:
-                    self.memory.extend(out["action"]["messages"])
+                    action_messages = out["action"]["messages"]
+                    self.memory.extend(action_messages)
+                    for tool_msg in action_messages:
+                        if isinstance(tool_msg, ToolMessage):
+                            tool_name = getattr(tool_msg, "name", "tool")
+                            self.app_gui.append_ai_chat(
+                                f"🧾 Результат {tool_name}: {tool_msg.content}\\n"
+                            )
+                    if action_messages:
+                        awaiting_tool_result = False
         except Exception as e:
             self.app_gui.append_ai_chat(f"⚠️ Ошибка ИИ: {e}\\n\\n")
         finally:
@@ -1256,6 +1398,8 @@ class ModernJiraApp(ctk.CTk):
         self.current_operation = None
         self.current_analysis = None
         self.guided_cycle_context: dict[str, dict] = {}
+        self._current_next_status: str = ""
+        self._current_next_transition_id: str = ""
 
         # Инициализация Master Analyzer
         try:
@@ -1586,9 +1730,33 @@ class ModernJiraApp(ctk.CTk):
 
         ctk.CTkLabel(
             status_panel,
-            text="Новый статус:",
+            text="Следующий по workflow:",
             font=ctk.CTkFont(size=13, weight="bold"),
         ).grid(row=1, column=0, padx=10, pady=10, sticky="e")
+
+        self.next_status_value = ctk.CTkLabel(
+            status_panel,
+            text="не рассчитан",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#616161",
+        )
+        self.next_status_value.grid(row=1, column=1, padx=10, pady=10, sticky="w")
+
+        self.move_next_status_btn = ctk.CTkButton(
+            status_panel,
+            text="Следующий статус",
+            width=140,
+            fg_color="#00796B",
+            hover_color="#00695C",
+            command=self.move_release_status_next,
+        )
+        self.move_next_status_btn.grid(row=1, column=2, padx=8, pady=10, sticky="w")
+
+        ctk.CTkLabel(
+            status_panel,
+            text="Новый статус (вручную):",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=2, column=0, padx=10, pady=10, sticky="e")
 
         self.target_status_entry = ctk.CTkEntry(
             status_panel,
@@ -1596,17 +1764,17 @@ class ModernJiraApp(ctk.CTk):
             font=ctk.CTkFont(size=13),
             placeholder_text="Напр: Ready for Prod",
         )
-        self.target_status_entry.grid(row=1, column=1, padx=10, pady=10, sticky="w")
+        self.target_status_entry.grid(row=2, column=1, padx=10, pady=10, sticky="w")
 
         self.move_status_btn = ctk.CTkButton(
             status_panel,
-            text="Сдвинуть статус",
+            text="Сдвинуть вручную",
             width=140,
-            fg_color="#00796B",
-            hover_color="#00695C",
+            fg_color="#455A64",
+            hover_color="#37474F",
             command=self.move_release_status_manual,
         )
-        self.move_status_btn.grid(row=1, column=2, padx=8, pady=10, sticky="w")
+        self.move_status_btn.grid(row=2, column=2, padx=8, pady=10, sticky="w")
 
         self.ai_pipeline_btn = ctk.CTkButton(
             status_panel,
@@ -1616,7 +1784,7 @@ class ModernJiraApp(ctk.CTk):
             hover_color="#4527A0",
             command=self.run_ai_release_pipeline,
         )
-        self.ai_pipeline_btn.grid(row=0, column=3, rowspan=2, padx=8, pady=10, sticky="ew")
+        self.ai_pipeline_btn.grid(row=0, column=3, rowspan=3, padx=8, pady=10, sticky="ew")
 
         options_frame = ctk.CTkFrame(actions_tab)
         options_frame.pack(fill="x", padx=4, pady=8)
@@ -1824,10 +1992,44 @@ class ModernJiraApp(ctk.CTk):
         issue = self.jira_service.get_issue_details(release_key)
         if not issue:
             self.release_status_value.configure(text="не найден", text_color="red")
+            self.next_status_value.configure(text="не определен", text_color="#C62828")
+            self._current_next_status = ""
+            self._current_next_transition_id = ""
             messagebox.showerror("Ошибка", f"Не удалось получить релиз {release_key}")
             return
         status = issue.get("fields", {}).get("status", {}).get("name", "Unknown")
         self.release_status_value.configure(text=status, text_color=self._release_status_color(status))
+
+        project_key = str(issue.get("fields", {}).get("project", {}).get("key", "")).strip().upper()
+        profile = get_release_flow_profile(project_key=project_key)
+        workflow_order = profile.get("workflow_order", []) or []
+        transition_ids = profile.get("transition_ids", {}) or {}
+
+        def _norm(value: str) -> str:
+            return (value or "").strip().lower()
+
+        normalized = [_norm(item) for item in workflow_order]
+        current_norm = _norm(status)
+
+        next_status = ""
+        next_transition_id = ""
+        if current_norm in normalized:
+            idx = normalized.index(current_norm)
+            if idx < len(workflow_order) - 1:
+                next_status = workflow_order[idx + 1]
+                next_transition_id = str(transition_ids.get(next_status) or "").strip()
+
+        self._current_next_status = next_status
+        self._current_next_transition_id = next_transition_id
+
+        if next_status:
+            transition_text = f" (id={next_transition_id})" if next_transition_id else ""
+            self.next_status_value.configure(
+                text=f"{next_status}{transition_text}",
+                text_color="#1565C0",
+            )
+        else:
+            self.next_status_value.configure(text="нет (финальный/вне workflow)", text_color="#616161")
 
     def move_release_status_manual(self):
         release_key = self.release_entry.get().strip().upper()
@@ -1846,6 +2048,51 @@ class ModernJiraApp(ctk.CTk):
         else:
             self.add_result(f"❌ {msg}")
             messagebox.showerror("Ошибка", msg)
+
+    def move_release_status_next(self):
+        release_key = self.release_entry.get().strip().upper()
+        if not release_key:
+            messagebox.showwarning("Ошибка", "Введите ключ релиза!")
+            return
+
+        self.refresh_release_status()
+        target_status = (self._current_next_status or "").strip()
+        target_id = (self._current_next_transition_id or "").strip()
+
+        if not target_status:
+            message = (
+                f"Для релиза {release_key} не найден следующий статус по workflow.\n"
+                "Возможно, релиз уже в финальном статусе или текущий статус не входит в профиль."
+            )
+            self.add_result(f"⚠️ {message}")
+            messagebox.showwarning("Нет следующего статуса", message)
+            return
+
+        ok, msg = self.jira_service.transition_issue(release_key, target_status)
+        if not ok and target_id:
+            ok, msg = self.jira_service.transition_issue_by_id(release_key, target_id)
+
+        if ok:
+            self.refresh_release_status()
+            self.add_result(f"✅ {msg}")
+            self.history.add(
+                "Смена статуса релиза (workflow next)",
+                {"release_key": release_key, "target_status": target_status, "transition_id": target_id or "-"},
+            )
+            self.history.save_to_file(self.history_path)
+            messagebox.showinfo("Готово", msg)
+            return
+
+        transitions = self.jira_service.get_available_transitions(release_key)
+        available = ", ".join(t.get("name", "Unknown") for t in transitions) if transitions else "нет данных"
+        details = (
+            f"Не удалось перевести {release_key} в '{target_status}'.\n"
+            f"Transition ID: {target_id or 'не задан'}\n"
+            f"Ошибка Jira: {msg}\n"
+            f"Доступные переходы: {available}"
+        )
+        self.add_result(f"❌ {details}")
+        messagebox.showerror("Ошибка перехода", details)
 
     def run_ai_release_pipeline(self):
         release_key = self.release_entry.get().strip().upper()
